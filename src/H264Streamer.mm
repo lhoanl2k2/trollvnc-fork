@@ -17,7 +17,9 @@
 #import <fcntl.h>
 #import <netinet/in.h>
 #import <netinet/tcp.h>
+#import <notify.h>
 #import <os/lock.h>
+#import <stdint.h>
 #import <stdlib.h>
 #import <sys/socket.h>
 #import <unistd.h>
@@ -84,10 +86,15 @@ static std::atomic<bool> gWantKey(false);
 static std::atomic<int> gNewBitrateKbps(0);
 static std::atomic<bool> gNeedDecoderReset(false); // set bit2 on next keyframe after session rebuild
 static std::atomic<bool> gShuttingDown(false);
-static std::atomic<uint64_t> gSessionGen(0); // prevents duplicate recoverFromEncoderError for the same session
+static std::atomic<uint64_t> gSessionGen(0); // monotonic generation allocator (owned by gEncQ)
+static std::atomic<uintptr_t> gActiveSessionGen(0); // 0 means callbacks from no session are accepted
+static std::atomic<double> gLastOutputAt(0.0);
+static std::atomic<double> gInFlightSince(0.0); // outstanding callback age, seconds from CACurrentMediaTime
+static os_unfair_lock gSessionCallbackLock = OS_UNFAIR_LOCK_INIT;
 
 // Encoder state: owned by gEncQ (the VT callback only touches atomics).
 static dispatch_queue_t gEncQ;
+static dispatch_queue_t gDisposeQ; // never block gEncQ waiting for VT callback shutdown
 static VTCompressionSessionRef gSession = NULL;
 static BOOL gUsingLowLatency = NO;
 static BOOL gForceStandardRC = NO; // sticky fallback when LowLatency RC faults on A11 heavy video
@@ -103,6 +110,10 @@ static CFTimeInterval gLastKeyWakeAt = -100;
 static CFTimeInterval gSessionFailedAt = -100;
 static CFTimeInterval gRetryEncoderAt = -100;
 static unsigned gEncoderFailures = 0;
+static CFTimeInterval gAccelRetryAt = -100;
+static dispatch_once_t gSystemNotifyOnce;
+static int gTimeNotifyToken = -1;
+static int gLanguageNotifyToken = -1;
 static std::atomic<bool> gEncoderProduced(false);
 static uint64_t gGeneration = 0;
 static int gRefinesLeft = 0;
@@ -113,6 +124,7 @@ static unsigned gCopies, gSupersededCopies, gCpuCopies, gEncodeCalls;
 static CFTimeInterval gLastStats;
 
 static void pumpEncoder(void);
+static void checkEncoderWatchdog(uintptr_t expectedGen);
 
 #pragma mark - Small helpers
 
@@ -160,12 +172,25 @@ static void teardownEncoder(void) {
     if (gSession) {
         VTCompressionSessionRef s = gSession;
         gSession = NULL;
-        gShuttingDown.store(true);
-        // Invalidate cancels in-flight frames immediately without trying to flush
-        // a malfunctioning AppleAVE2 session, and waits for active callbacks.
-        VTCompressionSessionInvalidate(s);
-        CFRelease(s);
-        gShuttingDown.store(false);
+        // Deactivate callbacks while holding the same short lock they use to
+        // account in-flight frames; never wait for VT invalidation on gEncQ.
+        os_unfair_lock_lock(&gSessionCallbackLock);
+        gActiveSessionGen.store(0, std::memory_order_release);
+        gInFlight.store(0, std::memory_order_relaxed);
+        gInFlightSince.store(0.0, std::memory_order_relaxed);
+        os_unfair_lock_unlock(&gSessionCallbackLock);
+        gShuttingDown.store(true, std::memory_order_release);
+        if (gDisposeQ) {
+            dispatch_async(gDisposeQ, ^{
+                VTCompressionSessionInvalidate(s);
+                CFRelease(s);
+            });
+        } else {
+            // Only used if queue initialization itself failed.
+            VTCompressionSessionInvalidate(s);
+            CFRelease(s);
+        }
+        gShuttingDown.store(false, std::memory_order_release);
     }
     if (gPool) {
         CVPixelBufferPoolRelease(gPool);
@@ -174,7 +199,8 @@ static void teardownEncoder(void) {
     setPB(&gPendingPB, NULL);
     setPB(&gLastPB, NULL);
     gEncW = gEncH = 0;
-    gInFlight.store(0);
+    gInFlight.store(0, std::memory_order_relaxed);
+    gInFlightSince.store(0.0, std::memory_order_relaxed);
 }
 
 static void recoverFromEncoderError(OSStatus errCode) {
@@ -248,26 +274,45 @@ static void wakeKeyFrame(void) {
     });
 }
 
-static void vtOutputImpl(void *sourceRefCon, OSStatus status, VTEncodeInfoFlags infoFlags, CMSampleBufferRef sb);
+static void vtOutputImpl(void *callbackRefCon, void *sourceRefCon, OSStatus status, VTEncodeInfoFlags infoFlags,
+                         CMSampleBufferRef sb);
 
 static void vtOutput(void *refCon, void *sourceRefCon, OSStatus status, VTEncodeInfoFlags infoFlags,
                      CMSampleBufferRef sb) {
     // VT's callback thread is not guaranteed to drain an autorelease pool per frame.
     @autoreleasepool {
-        vtOutputImpl(sourceRefCon, status, infoFlags, sb);
+        vtOutputImpl(refCon, sourceRefCon, status, infoFlags, sb);
     }
 }
 
-static void vtOutputImpl(void *sourceRefCon, OSStatus status, VTEncodeInfoFlags infoFlags, CMSampleBufferRef sb) {
-    gInFlight.fetch_sub(1);
+static void vtOutputImpl(void *callbackRefCon, void *sourceRefCon, OSStatus status, VTEncodeInfoFlags infoFlags,
+                         CMSampleBufferRef sb) {
+    // Reject late callbacks before touching gInFlight: they belong to a disposed
+    // VT session and must not underflow the new session's counter.
+    const uintptr_t cbGen = (uintptr_t)callbackRefCon;
+    if (cbGen == 0)
+        return;
+    os_unfair_lock_lock(&gSessionCallbackLock);
+    if (cbGen != gActiveSessionGen.load(std::memory_order_acquire)) {
+        os_unfair_lock_unlock(&gSessionCallbackLock);
+        return;
+    }
+    int remaining = gInFlight.fetch_sub(1, std::memory_order_relaxed) - 1;
+    double outputAt = CACurrentMediaTime();
+    if (remaining <= 0)
+        gInFlightSince.store(0.0, std::memory_order_relaxed);
+    else
+        gInFlightSince.store(outputAt, std::memory_order_relaxed);
+    gLastOutputAt.store(outputAt, std::memory_order_relaxed);
+    os_unfair_lock_unlock(&gSessionCallbackLock);
+
     if (gShuttingDown.load(std::memory_order_relaxed))
         return;
     if (status != noErr) {
         gWantKey.store(true);
-        uint64_t errGen = gSessionGen.load(std::memory_order_relaxed);
         if (gEncQ) {
             dispatch_async(gEncQ, ^{
-                if (gSession && gSessionGen.load(std::memory_order_relaxed) == errGen)
+                if (gSession && gActiveSessionGen.load(std::memory_order_acquire) == cbGen)
                     recoverFromEncoderError(status);
             });
         }
@@ -430,13 +475,22 @@ static BOOL createSession(int w, int h, BOOL lowLatency) {
         (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey : @{},
     };
     VTCompressionSessionRef s = NULL;
-    OSStatus st =
-        VTCompressionSessionCreate(kCFAllocatorDefault, w, h, kCMVideoCodecType_H264, (__bridge CFDictionaryRef)spec,
-                                   (__bridge CFDictionaryRef)srcAttrs, kCFAllocatorDefault, vtOutput, NULL, &s);
+    uintptr_t gen = (uintptr_t)(gSessionGen.fetch_add(1, std::memory_order_relaxed) + 1);
+    if (gen == 0) {
+        gen = 1;
+        gSessionGen.store(1, std::memory_order_relaxed);
+    }
+    gActiveSessionGen.store(gen, std::memory_order_release);
+    OSStatus st = VTCompressionSessionCreate(kCFAllocatorDefault, w, h, kCMVideoCodecType_H264,
+                                             (__bridge CFDictionaryRef)spec, (__bridge CFDictionaryRef)srcAttrs,
+                                             kCFAllocatorDefault, vtOutput, (void *)gen, &s);
     if (st != noErr || !s) {
+        gActiveSessionGen.store(0, std::memory_order_release);
         TVLog(@"H264: VTCompressionSessionCreate(lowLatency=%d) failed: %d", (int)lowLatency, (int)st);
         return NO;
     }
+    gLastOutputAt.store(CACurrentMediaTime(), std::memory_order_relaxed);
+    gInFlightSince.store(0.0, std::memory_order_relaxed);
     gSession = s;
     gUsingLowLatency = lowLatency;
     TVLog(@"H264: encoder ready %dx%d lowLatency=%d bitrate=%dkbps fps<=%d", w, h, (int)lowLatency, gBitrateKbps,
@@ -486,7 +540,6 @@ static BOOL ensureSession(int w, int h) {
     }
     gEncW = w;
     gEncH = h;
-    gSessionGen.fetch_add(1, std::memory_order_relaxed);
     gWantKey.store(true);
     gNeedDecoderReset.store(true);
     return YES;
@@ -494,6 +547,19 @@ static BOOL ensureSession(int w, int h) {
 
 // Copy the capture surface into a pooled buffer (the capture surface is
 // overwritten on the next display tick while the encoder may still read).
+static void retryIOSurfaceAcceleratorIfDue(void) {
+    CFTimeInterval now = CACurrentMediaTime();
+    if (gAccel || now < gAccelRetryAt)
+        return;
+    // Rate-limit recovery so a broken IOSurface service does not churn handles
+    // on every display frame. CPU copy remains the safe fallback meanwhile.
+    gAccelRetryAt = now + 2.0;
+    IOSurfaceAcceleratorRef accel = NULL;
+    if (IOSurfaceAcceleratorCreate(kCFAllocatorDefault, NULL, &accel) == kIOReturnSuccess)
+        gAccel = accel;
+    gAccelTried = YES;
+}
+
 static CVPixelBufferRef copyFrame(CVPixelBufferRef src) {
     CVPixelBufferRef dst = NULL;
     NSDictionary *aux = @{(__bridge NSString *)kCVPixelBufferPoolAllocationThresholdKey : @(kPoolThreshold)};
@@ -504,13 +570,24 @@ static CVPixelBufferRef copyFrame(CVPixelBufferRef src) {
 
     if (!gAccelTried) {
         gAccelTried = YES;
-        if (IOSurfaceAcceleratorCreate(kCFAllocatorDefault, NULL, &gAccel) != kIOReturnSuccess)
+        if (IOSurfaceAcceleratorCreate(kCFAllocatorDefault, NULL, &gAccel) != kIOReturnSuccess) {
             gAccel = NULL;
+            gAccelRetryAt = CACurrentMediaTime() + 2.0;
+        } else {
+            gAccelRetryAt = CACurrentMediaTime() + 2.0;
+        }
     }
     IOSurfaceRef s = CVPixelBufferGetIOSurface(src);
     IOSurfaceRef d = CVPixelBufferGetIOSurface(dst);
-    if (gAccel && s && d && IOSurfaceAcceleratorTransferSurface(gAccel, s, d, NULL, NULL, NULL, NULL) == kIOReturnSuccess)
-        return dst;
+    if (gAccel && s && d) {
+        IOReturn transfer = IOSurfaceAcceleratorTransferSurface(gAccel, s, d, NULL, NULL, NULL, NULL);
+        if (transfer == kIOReturnSuccess)
+            return dst;
+        CFRelease(gAccel);
+        gAccel = NULL;
+        gAccelRetryAt = CACurrentMediaTime() + 2.0;
+    }
+    retryIOSurfaceAcceleratorIfDue();
 
     // CPU fallback (only if the accelerator is unavailable).
     gCpuCopies++;
@@ -563,13 +640,38 @@ static void encodeNow(void) {
     NSDictionary *props = key ? @{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame : @YES} : nil;
     int rot = gRotFn ? (gRotFn() & 3) : 0;
     CMTime pts = CMTimeMakeWithSeconds(CACurrentMediaTime(), 1000000);
-    gInFlight.fetch_add(1);
+    const double submittedAt = CACurrentMediaTime();
+    const uintptr_t sentGen = gActiveSessionGen.load(std::memory_order_acquire);
+    os_unfair_lock_lock(&gSessionCallbackLock);
+    if (!gSession || sentGen == 0 || gActiveSessionGen.load(std::memory_order_acquire) != sentGen) {
+        os_unfair_lock_unlock(&gSessionCallbackLock);
+        CVPixelBufferRelease(pb);
+        return;
+    }
+    int previousInFlight = gInFlight.fetch_add(1, std::memory_order_relaxed);
+    if (previousInFlight == 0)
+        gInFlightSince.store(submittedAt, std::memory_order_relaxed);
+    os_unfair_lock_unlock(&gSessionCallbackLock);
     gEncodeCalls++;
     OSStatus st = VTCompressionSessionEncodeFrame(gSession, pb, pts, kCMTimeInvalid, (__bridge CFDictionaryRef)props,
                                                   (void *)(intptr_t)(rot | (key ? 4 : 0)), NULL);
     gLastEncodeAt = CACurrentMediaTime();
+    if (sentGen != 0 && gEncQ) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.55 * NSEC_PER_SEC)), gEncQ, ^{
+            checkEncoderWatchdog(sentGen);
+        });
+    }
     if (st != noErr) {
-        gInFlight.fetch_sub(1);
+        os_unfair_lock_lock(&gSessionCallbackLock);
+        if (gActiveSessionGen.load(std::memory_order_acquire) == sentGen) {
+            int count = gInFlight.load(std::memory_order_relaxed);
+            if (count > 0) {
+                count = gInFlight.fetch_sub(1, std::memory_order_relaxed) - 1;
+                if (count <= 0)
+                    gInFlightSince.store(0.0, std::memory_order_relaxed);
+            }
+        }
+        os_unfair_lock_unlock(&gSessionCallbackLock);
         setPB(&gLastPB, pb);
         CVPixelBufferRelease(pb);
         recoverFromEncoderError(st);
@@ -584,7 +686,26 @@ static void encodeNow(void) {
     scheduleRefine(gGeneration, isRefine ? 0.4 : 0.15);
 }
 
+static void checkEncoderWatchdog(uintptr_t expectedGen) {
+    if (expectedGen == 0 || !gSession ||
+        gActiveSessionGen.load(std::memory_order_acquire) != expectedGen)
+        return;
+    int inFlight = gInFlight.load(std::memory_order_relaxed);
+    double since = gInFlightSince.load(std::memory_order_relaxed);
+    double lastOutput = gLastOutputAt.load(std::memory_order_relaxed);
+    double now = CACurrentMediaTime();
+    // gInFlightSince tracks oldest outstanding work (and refreshes when a
+    // callback makes progress while other frames remain). This also catches a
+    // saturated encoder where pumpEncoder cannot submit another frame.
+    if (inFlight > 0 && since > 0.0 && now - since >= 1.5 &&
+        now - lastOutput >= 1.5 && gActiveSessionGen.load(std::memory_order_acquire) == expectedGen) {
+        TVLog(@"H264: encoder watchdog tripped (inFlight=%d) — rebuilding session", inFlight);
+        recoverFromEncoderError(-12912);
+    }
+}
+
 static void pumpEncoder(void) {
+    checkEncoderWatchdog(gActiveSessionGen.load(std::memory_order_acquire));
     if (!gPendingPB || !gSession)
         return;
     double minInterval = 1.0 / (double)(gMaxFps > 0 ? gMaxFps : 60) * 0.9;
@@ -898,10 +1019,40 @@ BOOL TVH264Start(void) {
     }
     if (!gNetQ)
         gNetQ = dispatch_queue_create("trollvnc.h264.net", DISPATCH_QUEUE_SERIAL);
+    if (!gDisposeQ)
+        gDisposeQ = dispatch_queue_create("trollvnc.h264.dispose", dispatch_queue_attr_make_with_qos_class(
+                                                                      DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
     if (!gClients)
         gClients = [NSMutableArray array];
-    if (!gEncQ || !gNetQ || !gClients)
+    if (!gEncQ || !gNetQ || !gDisposeQ || !gClients)
         return NO;
+
+    dispatch_once(&gSystemNotifyOnce, ^{
+        if (gEncQ) {
+            uint32_t rc = notify_register_dispatch("SignificantTimeChangeNotification", &gTimeNotifyToken, gEncQ, ^(int token) {
+                (void)token;
+                if (gClientCount.load(std::memory_order_relaxed) > 0) {
+                    gWantKey.store(true, std::memory_order_relaxed);
+                    if (gLastPB && !gPendingPB) { setPB(&gPendingPB, gLastPB); pumpEncoder(); }
+                    void (^cb)(int) = gFpsChanged;
+                    if (cb) dispatch_async(dispatch_get_main_queue(), ^{ cb(0); });
+                }
+            });
+            if (rc != NOTIFY_STATUS_OK)
+                TVLog(@"H264: failed to register SignificantTimeChangeNotification (%u)", rc);
+            rc = notify_register_dispatch("com.apple.language.changed", &gLanguageNotifyToken, gEncQ, ^(int token) {
+                (void)token;
+                if (gClientCount.load(std::memory_order_relaxed) > 0) {
+                    gWantKey.store(true, std::memory_order_relaxed);
+                    if (gLastPB && !gPendingPB) { setPB(&gPendingPB, gLastPB); pumpEncoder(); }
+                    void (^cb)(int) = gFpsChanged;
+                    if (cb) dispatch_async(dispatch_get_main_queue(), ^{ cb(0); });
+                }
+            });
+            if (rc != NOTIFY_STATUS_OK)
+                TVLog(@"H264: failed to register com.apple.language.changed (%u)", rc);
+        }
+    });
 
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0)
