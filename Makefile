@@ -1,4 +1,4 @@
-export PACKAGE_VERSION := 3.2-272
+export PACKAGE_VERSION := 3.3-1009
 export THEOS_PACKAGE_SCHEME
 
 ifeq ($(THEOS_DEVICE_SIMULATOR),1)
@@ -28,6 +28,7 @@ trollvncserver_FILES += src/ClipboardManager.mm
 trollvncserver_FILES += src/ScreenCapturer.mm
 trollvncserver_FILES += src/STHIDEventGenerator.mm
 trollvncserver_FILES += src/OhMyJetsam.mm
+trollvncserver_FILES += src/H264Streamer.mm
 
 trollvncserver_CFLAGS += -fobjc-arc
 trollvncserver_CFLAGS += -Wno-unknown-warning-option
@@ -82,6 +83,7 @@ trollvncserver_FRAMEWORKS += IOSurface
 trollvncserver_FRAMEWORKS += QuartzCore
 trollvncserver_FRAMEWORKS += UIKit
 trollvncserver_FRAMEWORKS += UserNotifications
+trollvncserver_FRAMEWORKS += VideoToolbox
 
 trollvncserver_PRIVATE_FRAMEWORKS += FrontBoardServices
 

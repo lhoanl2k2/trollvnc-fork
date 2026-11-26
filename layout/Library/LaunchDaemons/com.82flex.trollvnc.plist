@@ -41,7 +41,7 @@
 	<key>StandardOutPath</key>
 	<string>/tmp/trollvnc-stdout.log</string>
 	<key>ThrottleInterval</key>
-	<integer>5</integer>
+	<integer>1</integer>
 	<key>UserName</key>
 	<string>mobile</string>
 	<key>_AdditionalProperties</key>

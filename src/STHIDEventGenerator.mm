@@ -62,12 +62,32 @@ typedef struct {
     int identifier;
     CGPoint point;
     IOHIDFloat pathMajorRadius;
+    IOHIDFloat pathMinorRadius;
+    IOHIDFloat pathTwist;
     IOHIDFloat pathPressure;
     UInt8 pathProximity;
     BOOL isStylus;
     IOHIDFloat azimuthAngle;
     IOHIDFloat altitudeAngle;
 } SyntheticEventDigitizerInfo;
+
+NS_INLINE double tvRand01(void) {
+    return (double)arc4random() / 4294967295.0;
+}
+
+NS_INLINE double tvRandSym(void) {
+    return tvRand01() * 2.0 - 1.0;
+}
+
+NS_INLINE CGPoint tvSubpixelPoint(CGPoint p, CGSize bounds) {
+    if (p.x > 2.5 && p.x < bounds.width - 3.5) {
+        p.x += (CGFloat)(tvRandSym() * 0.40);
+    }
+    if (p.y > 2.5 && p.y < bounds.height - 3.5) {
+        p.y += (CGFloat)(tvRandSym() * 0.40);
+    }
+    return p;
+}
 
 NS_INLINE CFTimeInterval secondsSinceAbsoluteTime(CFAbsoluteTime startTime) {
     return (CFAbsoluteTimeGetCurrent() - startTime);
@@ -242,14 +262,22 @@ NS_INLINE void _DTXCalcLinearPinchStartEndPoints(CGRect bounds, CGFloat pixelsSc
 
 #pragma mark - HID Events
 
+- (BOOL)hasActiveTouch {
+    @synchronized(self) {
+        return _activePointCount > 0;
+    }
+}
+
 - (void)_sendIOHIDKeyboardEvent:(uint32_t)page usage:(uint32_t)usage isKeyDown:(boolean_t)isKeyDown {
     if (page != kHIDPage_Telephony) {
         uint64_t keyCode = ((uint64_t)page << 32) | usage;
         NSNumber *nsKeyCode = @(keyCode);
-        if (isKeyDown) {
-            [_activeKeyCodes addObject:nsKeyCode];
-        } else {
-            [_activeKeyCodes removeObject:nsKeyCode];
+        @synchronized(self) {
+            if (isKeyDown) {
+                [_activeKeyCodes addObject:nsKeyCode];
+            } else {
+                [_activeKeyCodes removeObject:nsKeyCode];
+            }
         }
     }
     [self __sendIOHIDKeyboardEvent:page usage:usage isKeyDown:isKeyDown];
@@ -473,23 +501,48 @@ static InterpolationType interpolationFromString(NSString *string) {
     IOHIDEventSetIntegerValue(eventRef, kIOHIDEventFieldIsBuiltIn, 1);
     IOHIDEventSetIntegerValue(eventRef, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
 
+    CGFloat denomW = (_physicalScreenSize.width > 1.0) ? (_physicalScreenSize.width - 1.0) : 1.0;
+    CGFloat denomH = (_physicalScreenSize.height > 1.0) ? (_physicalScreenSize.height - 1.0) : 1.0;
+
     for (NSUInteger i = 0; i < _activePointCount; ++i) {
         SyntheticEventDigitizerInfo *pointInfo = &_activePoints[i];
         if (eventType == HandEventTouched) {
-            if (!pointInfo->pathMajorRadius)
-                pointInfo->pathMajorRadius = defaultMajorRadius;
+            if (!pointInfo->pathMajorRadius) {
+                pointInfo->pathMajorRadius = (IOHIDFloat)(5.20 + tvRand01() * 1.45);
+                pointInfo->pathMinorRadius = pointInfo->pathMajorRadius * (IOHIDFloat)(0.77 + tvRand01() * 0.12);
+            }
+            if (!pointInfo->pathTwist)
+                pointInfo->pathTwist = (IOHIDFloat)(90.0 + tvRandSym() * 14.0);
             if (!pointInfo->pathPressure)
                 pointInfo->pathPressure = defaultPathPressure;
             if (!pointInfo->pathProximity)
                 pointInfo->pathProximity = kGSEventPathInfoInTouch | kGSEventPathInfoInRange;
+        } else if (eventType == HandEventMoved || eventType == HandEventChordChanged) {
+            if (!pointInfo->pathMajorRadius) {
+                pointInfo->pathMajorRadius = (IOHIDFloat)(5.20 + tvRand01() * 1.45);
+                pointInfo->pathMinorRadius = pointInfo->pathMajorRadius * (IOHIDFloat)(0.77 + tvRand01() * 0.12);
+            } else {
+                pointInfo->pathMajorRadius = (IOHIDFloat)fmin(7.25, fmax(4.65, pointInfo->pathMajorRadius + tvRandSym() * 0.07));
+                IOHIDFloat minR = pointInfo->pathMajorRadius * 0.72;
+                IOHIDFloat maxR = pointInfo->pathMajorRadius * 0.92;
+                pointInfo->pathMinorRadius = (IOHIDFloat)fmin(maxR, fmax(minR, pointInfo->pathMinorRadius + tvRandSym() * 0.05));
+            }
+            if (!pointInfo->pathTwist)
+                pointInfo->pathTwist = 90.0;
+            else
+                pointInfo->pathTwist = (IOHIDFloat)fmin(112.0, fmax(68.0, pointInfo->pathTwist + tvRandSym() * 0.45));
         } else if (eventType == HandEventLifted || eventType == HandEventCanceled || eventType == StylusEventLifted) {
             pointInfo->pathMajorRadius = 0;
+            pointInfo->pathMinorRadius = 0;
+            pointInfo->pathTwist = 0;
             pointInfo->pathPressure = 0;
             pointInfo->pathProximity = 0;
         }
 
         CGPoint point = pointInfo->point;
-        point = CGPointMake(point.x / _physicalScreenSize.width, point.y / _physicalScreenSize.height);
+        CGFloat nx = (CGFloat)fmin(1.0, fmax(0.0, point.x / denomW));
+        CGFloat ny = (CGFloat)fmin(1.0, fmax(0.0, point.y / denomH));
+        point = CGPointMake(nx, ny);
 
         IOHIDEventRef subEvent;
         if (pointInfo->isStylus) {
@@ -514,6 +567,7 @@ static InterpolationType interpolationFromString(NSString *string) {
                 IOHIDEventSetIntegerValue(subEvent, kIOHIDEventFieldDigitizerDidUpdateMask, 0x0400);
 
         } else {
+            IOHIDFloat twist = pointInfo->pathTwist ? pointInfo->pathTwist : 90.0;
             subEvent = IOHIDEventCreateDigitizerFingerEvent(kCFAllocatorDefault,     // allocator
                                                             machTime,                // timestamp
                                                             pointInfo->identifier,   // index
@@ -521,14 +575,15 @@ static InterpolationType interpolationFromString(NSString *string) {
                                                             eventMask,               // eventMask
                                                             point.x, point.y, 0,     // x, y, z
                                                             pointInfo->pathPressure, // tipPressure
-                                                            90.0,                    // twist
+                                                            twist,                   // twist
                                                             pointInfo->pathProximity & kGSEventPathInfoInRange, // range
                                                             pointInfo->pathProximity & kGSEventPathInfoInTouch, // touch
                                                             kIOHIDEventOptionNone);
         }
 
+        IOHIDFloat minorR = pointInfo->isStylus ? pointInfo->pathMajorRadius : pointInfo->pathMinorRadius;
         IOHIDEventSetFloatValue(subEvent, kIOHIDEventFieldDigitizerMinorRadius,
-                                pointInfo->pathMajorRadius); // minor radius
+                                minorR); // minor radius
         IOHIDEventSetFloatValue(subEvent, kIOHIDEventFieldDigitizerMajorRadius,
                                 pointInfo->pathMajorRadius); // major radius
 
@@ -566,29 +621,34 @@ static void _sendHIDEvent(IOHIDEventRef eventRef, dispatch_queue_t queue) {
 - (void)_updateTouchPoints:(CGPoint *)points count:(NSUInteger)count {
     NSParameterAssert(count > 0);
 
-    HandEventType handEventType;
+    IOHIDEventRef eventRef = NULL;
+    @synchronized(self) {
+        HandEventType handEventType;
 
-    // The hand event type is based on previous state.
-    if (!_activePointCount)
-        handEventType = HandEventTouched;
-    else if (!count)
-        handEventType = HandEventLifted;
-    else if (count == _activePointCount)
-        handEventType = HandEventMoved;
-    else
-        handEventType = HandEventChordChanged;
+        // The hand event type is based on previous state.
+        if (!_activePointCount)
+            handEventType = HandEventTouched;
+        else if (!count)
+            handEventType = HandEventLifted;
+        else if (count == _activePointCount)
+            handEventType = HandEventMoved;
+        else
+            handEventType = HandEventChordChanged;
 
-    // Update previous count for next event.
-    _activePointCount = count;
+        // Update previous count for next event.
+        _activePointCount = count;
 
-    // Update point locations.
-    for (NSUInteger i = 0; i < count; ++i) {
-        _activePoints[i].point = points[i];
+        // Update point locations (with subtle sub-pixel de-quantization away from edges).
+        for (NSUInteger i = 0; i < count; ++i) {
+            _activePoints[i].point = tvSubpixelPoint(points[i], _physicalScreenSize);
+        }
+
+        eventRef = [self _createIOHIDEventType:handEventType];
     }
-
-    IOHIDEventRef eventRef = [self _createIOHIDEventType:handEventType];
-    _sendHIDEvent(eventRef, _hidEventQueue);
-    CFRelease(eventRef);
+    if (eventRef) {
+        _sendHIDEvent(eventRef, _hidEventQueue);
+        CFRelease(eventRef);
+    }
 }
 
 - (void)touchDownAtPoints:(CGPoint *)locations touchCount:(NSUInteger)touchCount {
@@ -596,16 +656,24 @@ static void _sendHIDEvent(IOHIDEventRef eventRef, dispatch_queue_t queue) {
 
     touchCount = MIN(touchCount, HIDMaxTouchCount);
 
-    _activePointCount = touchCount;
+    IOHIDEventRef eventRef = NULL;
+    @synchronized(self) {
+        _activePointCount = touchCount;
 
-    for (NSUInteger index = 0; index < touchCount; ++index) {
-        _activePoints[index].point = locations[index];
-        _activePoints[index].isStylus = NO;
+        for (NSUInteger index = 0; index < touchCount; ++index) {
+            _activePoints[index].point = tvSubpixelPoint(locations[index], _physicalScreenSize);
+            _activePoints[index].isStylus = NO;
+            _activePoints[index].pathMajorRadius = 0;
+            _activePoints[index].pathMinorRadius = 0;
+            _activePoints[index].pathTwist = 0;
+        }
+
+        eventRef = [self _createIOHIDEventType:HandEventTouched];
     }
-
-    IOHIDEventRef eventRef = [self _createIOHIDEventType:HandEventTouched];
-    _sendHIDEvent(eventRef, _hidEventQueue);
-    CFRelease(eventRef);
+    if (eventRef) {
+        _sendHIDEvent(eventRef, _hidEventQueue);
+        CFRelease(eventRef);
+    }
 }
 
 - (void)_touchDown:(CGPoint)location touchCount:(NSUInteger)touchCount {
@@ -639,20 +707,32 @@ static void _sendHIDEvent(IOHIDEventRef eventRef, dispatch_queue_t queue) {
 - (void)liftUpAtPoints:(CGPoint *)locations touchCount:(NSUInteger)touchCount {
     NSParameterAssert(touchCount > 0);
 
-    touchCount = MIN(touchCount, HIDMaxTouchCount);
-    touchCount = MIN(touchCount, _activePointCount);
+    IOHIDEventRef eventRef = NULL;
+    @synchronized(self) {
+        touchCount = MIN(touchCount, HIDMaxTouchCount);
+        touchCount = MIN(touchCount, _activePointCount);
+        if (touchCount == 0)
+            return;
 
-    NSUInteger newPointCount = _activePointCount - touchCount;
+        NSUInteger newPointCount = _activePointCount - touchCount;
 
-    for (NSUInteger index = 0; index < touchCount; ++index) {
-        _activePoints[newPointCount + index].point = locations[index];
+        for (NSUInteger index = 0; index < touchCount; ++index) {
+            CGPoint prev = _activePoints[newPointCount + index].point;
+            CGPoint loc = locations[index];
+            // Keep exact resting contact point if lift is within 1.5 px so a
+            // stationary lift never synthesizes last-instant displacement.
+            if (hypot(loc.x - prev.x, loc.y - prev.y) > 1.5) {
+                _activePoints[newPointCount + index].point = tvSubpixelPoint(loc, _physicalScreenSize);
+            }
+        }
+
+        eventRef = [self _createIOHIDEventType:HandEventLifted];
+        _activePointCount = newPointCount;
     }
-
-    IOHIDEventRef eventRef = [self _createIOHIDEventType:HandEventLifted];
-    _sendHIDEvent(eventRef, _hidEventQueue);
-    CFRelease(eventRef);
-
-    _activePointCount = newPointCount;
+    if (eventRef) {
+        _sendHIDEvent(eventRef, _hidEventQueue);
+        CFRelease(eventRef);
+    }
 }
 
 - (void)_liftUp:(CGPoint)location touchCount:(NSUInteger)touchCount {
@@ -914,6 +994,46 @@ static void _sendHIDEvent(IOHIDEventRef eventRef, dispatch_queue_t queue) {
 
     [self _touchDown:startLocation touchCount:1];
     [self _moveCurveToPoints:&endLocation touchCount:1 duration:seconds];
+    [self _liftUp:endLocation touchCount:1];
+    [self sendMarkerHIDEvent];
+}
+
+- (void)scrollDampedWithStartPoint:(CGPoint)startLocation endPoint:(CGPoint)endLocation duration:(NSTimeInterval)seconds {
+    NSParameterAssert(seconds > 0.0);
+
+    CGFloat dx = endLocation.x - startLocation.x;
+    CGFloat dy = endLocation.y - startLocation.y;
+    CGFloat dist = hypot(dx, dy);
+    // Subtle perpendicular thumb arc (±0.8..1.8 px) so wheel drags are never
+    // mathematically straight (dx == 0.0000).
+    CGFloat perpX = (dist > 1.0) ? (-dy / dist) : 1.0;
+    CGFloat perpY = (dist > 1.0) ? (dx / dist) : 0.0;
+    CGFloat arcAmp = (CGFloat)((0.8 + tvRand01() * 1.0) * (tvRandSym() >= 0 ? 1.0 : -1.0));
+
+    [self _touchDown:startLocation touchCount:1];
+
+    CFAbsoluteTime startTime = CFAbsoluteTimeGetCurrent();
+    CFTimeInterval elapsed = 0;
+    int eventIndex = 0;
+    while (elapsed < (seconds - fingerMoveInterval)) {
+        elapsed = secondsSinceAbsoluteTime(startTime);
+        double t = fmin(1.0, fmax(0.0, elapsed / seconds));
+        // Ease-out progress so finger slows naturally toward the target row.
+        double u = 1.0 - (1.0 - t) * (1.0 - t);
+        double arc = sin(t * M_PI) * arcAmp;
+        CGPoint nextPt = CGPointMake(
+            (CGFloat)fmin(_physicalScreenSize.width - 1.0, fmax(0.0, startLocation.x + dx * u + perpX * arc)),
+            (CGFloat)fmin(_physicalScreenSize.height - 1.0, fmax(0.0, startLocation.y + dy * u + perpY * arc))
+        );
+        [self _updateTouchPoints:&nextPt count:1];
+        delayBetweenMove(eventIndex++, elapsed);
+    }
+
+    [self _updateTouchPoints:&endLocation count:1];
+    // Hold briefly (~46 ms) at endLocation so UIScrollView / UIPickerView
+    // resets velocity to zero instead of flinging uncontrollably.
+    struct timespec settle = {0, 46000000L};
+    nanosleep(&settle, NULL);
     [self _liftUp:endLocation touchCount:1];
     [self sendMarkerHIDEvent];
 }
@@ -1623,13 +1743,17 @@ static inline uint32_t hidUsageCodeForCharacter(NSString *key) {
 }
 
 - (void)releaseEveryKeys {
-    for (NSNumber *nsKeyCode in _activeKeyCodes) {
+    NSArray<NSNumber *> *snapshot = nil;
+    @synchronized(self) {
+        snapshot = [_activeKeyCodes allObjects];
+        [_activeKeyCodes removeAllObjects];
+    }
+    for (NSNumber *nsKeyCode in snapshot) {
         uint64_t keyCode = [nsKeyCode unsignedLongLongValue];
         uint32_t page = (keyCode >> 32);
         uint32_t usage = (keyCode & 0xFFFFFFFF);
         [self __sendIOHIDKeyboardEvent:page usage:usage isKeyDown:false];
     }
-    [_activeKeyCodes removeAllObjects];
 }
 
 - (void)hardwareLock {

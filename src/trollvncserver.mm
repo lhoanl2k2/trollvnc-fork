@@ -38,6 +38,7 @@
 #import <rfb/rfb.h>
 #import <string>
 #import <sys/socket.h>
+#import <sys/time.h>
 #import <sys/sysctl.h>
 #import <time.h>
 #import <unistd.h>
@@ -52,6 +53,7 @@
 #import "PSAssistiveTouchSettingsDetail.h"
 #import "STHIDEventGenerator.h"
 #import "ScreenCapturer.h"
+#import "H264Streamer.h"
 
 #define LocalizedString(key, comment, bundle, table)                                                                   \
     (NSLocalizedStringFromTableInBundle((key), (table), (bundle), (comment)) ?: (key))
@@ -76,6 +78,8 @@ static BOOL gClipboardEnabled = YES;
 static BOOL gIsDaemonMode = NO; // set when launched with -daemon
 
 static double gScale = 1.0; // 0 < scale <= 1.0, 1.0 = no scaling
+static int gH264Port = -1;       // iOSView H.264 stream port (-1 = VNC port + 10, 0 = off)
+static int gH264BitrateKbps = 0; // 0 = default
 // Preferred frame rate range (0 = unspecified)
 static int gFpsMin = 0;
 static int gFpsPref = 0;
@@ -490,6 +494,16 @@ static void parseDaemonOptions(void) {
         } else {
             gPort = v;
         }
+    }
+
+    NSNumber *h264PortN = [prefs objectForKey:@"H264Port"];
+    if ([h264PortN isKindOfClass:[NSNumber class]] || [h264PortN isKindOfClass:[NSString class]]) {
+        int v = h264PortN.intValue;
+        gH264Port = (v == 0 || (v >= 1024 && v <= 65535)) ? v : -1;
+    }
+    NSNumber *h264BrN = [prefs objectForKey:@"H264BitrateKbps"];
+    if ([h264BrN isKindOfClass:[NSNumber class]] || [h264BrN isKindOfClass:[NSString class]]) {
+        gH264BitrateKbps = h264BrN.intValue;
     }
 
     NSNumber *keepAliveN = [prefs objectForKey:@"KeepAliveSec"];
@@ -1406,6 +1420,10 @@ static void parseCLI(int argc, const char *argv[]) {
 
 static rfbScreenInfoPtr gScreen = NULL;
 static void (^gFrameHandler)(CMSampleBufferRef) = nil;
+// Clients that actually want VNC pixels. iOSView keeps a control-only VNC
+// connection (1x1 requests) and watches over H.264, so while this is 0 the
+// CPU scale/copy path for VNC is skipped entirely.
+static std::atomic<int> gPixelClients(0);
 
 static int gWidth = 0;
 static int gHeight = 0;
@@ -2052,8 +2070,8 @@ NS_INLINE CGPoint vncPointToDevicePoint(int vx, int vy) {
     int rotH = (effRotQ % 2 == 0) ? gSrcHeight : gSrcWidth;
 
     // Undo scaling from stage(rotW x rotH) -> VNC(gWidth x gHeight)
-    double sx = (gWidth > 0) ? ((double)rotW / (double)gWidth) : 1.0;
-    double sy = (gHeight > 0) ? ((double)rotH / (double)gHeight) : 1.0;
+    double sx = (gWidth > 1) ? ((double)(rotW - 1) / (double)(gWidth - 1)) : 1.0;
+    double sy = (gHeight > 1) ? ((double)(rotH - 1) / (double)(gHeight - 1)) : 1.0;
     double stX = sx * (double)vx;
     double stY = sy * (double)vy;
 
@@ -2116,6 +2134,7 @@ typedef struct {
     BOOL wheelFlushScheduled;          // whether a flush is pending for this client
     BOOL isRepeaterClient;             // whether this client is a repeater
     char clientId8[CLIENT_ID_LEN + 1]; // cached 8-char client id (NUL-terminated)
+    BOOL isPixelClient;                // requested a real screen region (not just 1x1 polling)
 #if DEBUG
     uint64_t updateStartNs;
     uint64_t updateStartCpuNs;
@@ -2204,14 +2223,14 @@ static void wheelScheduleFlush(rfbClientPtr cl, CGPoint anchorPoint, double dela
         st2->wheelAccumPx = 0.0; // zero out
         st2->wheelFlushScheduled = NO;
         double mag = fabs(takeRaw);
-        if (mag < 1.0) {
+        STHIDEventGenerator *gen = [STHIDEventGenerator sharedGenerator];
+        if (mag < 1.0 || (st2->lastButtonMask & 1) != 0 || [gen hasActiveTouch]) {
             rfbDecrClientRef(cl);
             return;
         }
 
-        // Velocity-like amplification: for larger accumulations (faster wheel),
-        // slightly increase distance instead of emitting many short drags.
-        double amp = 1.0 + fmin(gWheelAmpCap, gWheelAmpCoeff * log1p(mag / fmax(gWheelStepPx, 1.0)));
+        // Gentle amplification for rapid wheel bursts without overshooting UIPickerView drums.
+        double amp = 1.0 + fmin(0.45, 0.22 * log1p(mag / fmax(gWheelStepPx, 1.0)));
         double take = copysign(mag * amp, takeRaw);
 
         // Guarantee a small-but-meaningful movement for tiny scrolls
@@ -2268,7 +2287,7 @@ static void wheelScheduleFlush(rfbClientPtr cl, CGPoint anchorPoint, double dela
         if (dur < gWheelDurMin)
             dur = gWheelDurMin;
 
-        [[STHIDEventGenerator sharedGenerator] dragLinearWithStartPoint:anchorPoint endPoint:endPt duration:dur];
+        [gen scrollDampedWithStartPoint:anchorPoint endPoint:endPt duration:dur];
 
         rfbDecrClientRef(cl);
     });
@@ -3092,12 +3111,36 @@ static BOOL gIsClipboardStarted = NO;
 static BOOL gRestoreAssist = NO;
 #endif
 
+// Main thread only. Single place that starts/stops capture so VNC (listener/client
+// threads) and H.264 (gNetQ) population changes cannot race each other.
+static void tvSyncCaptureState(void) {
+    BOOL want = (gClientCount > 0 || TVH264ClientCount() > 0) && gFrameHandler != nil;
+    if (want && !gIsCaptureStarted) {
+        gIsCaptureStarted = YES;
+        [[ScreenCapturer sharedCapturer] startCaptureWithFrameHandler:gFrameHandler];
+        [[ScreenCapturer sharedCapturer] forceNextFrameUpdate];
+        TVLog(@"Screen capture started (vnc=%d, h264=%d).", gClientCount, TVH264ClientCount());
+    } else if (!want && gIsCaptureStarted) {
+        [[ScreenCapturer sharedCapturer] endCapture];
+        gIsCaptureStarted = NO;
+        TVLog(@"No clients remaining; screen capture stopped.");
+    }
+}
+
+static void tvScheduleSyncCaptureState(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        tvSyncCaptureState();
+    });
+}
+
 static void clientGoneHook(rfbClientPtr cl) {
     // Free per-client state
     TVClientState *st = tvGetClientState(cl);
     BOOL isRepeaterClient = NO;
     NSString *removeKey = nil;
     if (st) {
+        if (st->isPixelClient)
+            gPixelClients.fetch_sub(1);
         isRepeaterClient = st->isRepeaterClient;
         if (st->clientId8[0] != '\0') {
             removeKey = [NSString stringWithUTF8String:st->clientId8];
@@ -3122,11 +3165,7 @@ static void clientGoneHook(rfbClientPtr cl) {
     NSString *host = (cl && cl->host) ? [NSString stringWithUTF8String:cl->host] : @"";
     TVLog(@"Client %@ disconnected, active clients=%d", host, gClientCount);
 
-    if (gIsCaptureStarted && gClientCount == 0) {
-        [[ScreenCapturer sharedCapturer] endCapture];
-        gIsCaptureStarted = NO;
-        TVLog(@"No clients remaining; screen capture stopped.");
-    }
+    tvScheduleSyncCaptureState();
 
     if (gIsClipboardStarted && gClientCount == 0) {
         [[ClipboardManager sharedManager] stop];
@@ -3166,8 +3205,46 @@ static void clientGoneHook(rfbClientPtr cl) {
     }
 }
 
+static void tvFramebufferUpdateRequestHook(rfbClientPtr cl, rfbFramebufferUpdateRequestMsg *fur) {
+    if ((int)fur->w * (int)fur->h < 1024)
+        return; // tiny polling request (e.g. iOSView control connection)
+    TVClientState *st = tvGetClientState(cl);
+    if (!st || st->isPixelClient)
+        return;
+    st->isPixelClient = YES;
+    if (gPixelClients.fetch_add(1) == 0) {
+        // VNC path was idle: make sure the next tick produces a fresh frame.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[ScreenCapturer sharedCapturer] forceNextFrameUpdate];
+        });
+    }
+}
+
 static enum rfbNewClientAction newClientHook(rfbClientPtr cl) {
+    if (cl && cl->sock != RFB_INVALID_SOCKET && cl->sock >= 0) {
+        int one = 1;
+        (void)setsockopt(cl->sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+#ifdef SO_NOSIGPIPE
+        (void)setsockopt(cl->sock, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+        (void)setsockopt(cl->sock, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+#ifdef TCP_KEEPALIVE
+        int idle = 5;
+        (void)setsockopt(cl->sock, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
+#endif
+#ifdef TCP_KEEPINTVL
+        int intvl = 2;
+        (void)setsockopt(cl->sock, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+#endif
+#ifdef TCP_KEEPCNT
+        int cnt = 3;
+        (void)setsockopt(cl->sock, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+        struct timeval sendTimeout = {3, 0};
+        (void)setsockopt(cl->sock, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, sizeof(sendTimeout));
+    }
     cl->clientGoneHook = clientGoneHook;
+    cl->clientFramebufferUpdateRequestHook = tvFramebufferUpdateRequestHook;
     if (!cl->viewOnly && gViewOnly)
         cl->viewOnly = TRUE;
 
@@ -3220,12 +3297,8 @@ static enum rfbNewClientAction newClientHook(rfbClientPtr cl) {
     // Notify client connected
     tvPublishClientConnectedNotif(host);
 
-    if (!gIsCaptureStarted && gClientCount > 0 && gFrameHandler) {
-        // Start capture when entering non-zero client population.
-        gIsCaptureStarted = YES;
-        [[ScreenCapturer sharedCapturer] startCaptureWithFrameHandler:gFrameHandler];
-        TVLog(@"Screen capture started (clients=%d).", gClientCount);
-    }
+    // Start capture when entering non-zero client population (decided on main).
+    tvScheduleSyncCaptureState();
 
     if (gClipboardEnabled && !gIsClipboardStarted && gClientCount > 0) {
         gIsClipboardStarted = YES;
@@ -3485,8 +3558,69 @@ static void prepareScreenCapturer(void) {
     }
 
     gFrameHandler = ^(CMSampleBufferRef _Nonnull sampleBuffer) {
-        handleFramebuffer(sampleBuffer);
+        TVH264PushFrame(sampleBuffer);
+        if (gPixelClients.load() > 0) {
+            handleFramebuffer(sampleBuffer);
+        } else {
+            // No VNC viewer wants pixels: only keep geometry (rotation) current.
+            int rotQ = (gOrientationSyncEnabled ? gRotationQuad.load(std::memory_order_relaxed) : 0) & 3;
+            maybeResizeFramebufferForRotation(rotQ);
+        }
     };
+}
+
+static int tvH264Rotation(void) {
+    return (gOrientationSyncEnabled ? gRotationQuad.load(std::memory_order_relaxed) : 0) & 3;
+}
+
+static dispatch_source_t gH264RetryTimer = NULL;
+
+static void setupH264Streamer(void) {
+    int port = gH264Port < 0 ? (gPort > 0 ? gPort + 10 : 0) : gH264Port;
+    if (port <= 0)
+        return;
+    int fps = gFpsMax > 0 ? gFpsMax : (gFpsPref > 0 ? gFpsPref : 60);
+    TVH264Configure(
+        port, gH264BitrateKbps, fps, tvH264Rotation,
+        ^(int n) {
+            // main thread
+            (void)n;
+            tvSyncCaptureState();
+            if (TVH264ClientCount() > 0)
+                [[ScreenCapturer sharedCapturer] forceNextFrameUpdate];
+        },
+        ^(int want) {
+            // main thread: iOSView asked for another frame rate. Capture at the
+            // smallest rate the 60 Hz display can tick evenly that still covers
+            // it (45 -> 60, 30 -> 30, 25 -> 30); the encoder paces the rest.
+            ScreenCapturer *sc = [ScreenCapturer sharedCapturer];
+            if (want <= 0) {
+                [sc setPreferredFrameRateWithMin:gFpsMin preferred:gFpsPref max:gFpsMax];
+            } else {
+                int cap = 60 / MAX(1, 60 / want);
+                [sc setPreferredFrameRateWithMin:cap preferred:cap max:cap];
+            }
+            [sc forceNextFrameUpdate];
+        });
+    if (!TVH264Start()) {
+        TVPrintError("WARNING: H.264 listener on port %d did not start; retrying every 2 seconds", port);
+        if (!gH264RetryTimer) {
+            gH264RetryTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+            if (gH264RetryTimer) {
+                dispatch_source_set_timer(gH264RetryTimer, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                                          2 * NSEC_PER_SEC, 200 * NSEC_PER_MSEC);
+                dispatch_source_set_event_handler(gH264RetryTimer, ^{
+                    if (TVH264Start()) {
+                        dispatch_source_t timer = gH264RetryTimer;
+                        gH264RetryTimer = NULL;
+                        dispatch_source_cancel(timer);
+                        TVLog(@"H.264 listener recovered on port %d", port);
+                    }
+                });
+                dispatch_resume(gH264RetryTimer);
+            }
+        }
+    }
 }
 
 static void prepareBulletinManager(void) {
@@ -3633,6 +3767,11 @@ static void setupRfbScreen(int argc, const char *argv[]) {
     // Server ports
     gScreen->port = gPort;
     gScreen->ipv6port = gPort;
+    // Keep parallel VNC observers alive even if a client omits ClientInit.shared.
+    gScreen->alwaysShared = TRUE;
+    // LibVNCServer uses milliseconds in rfbReadExact/rfbWriteExact. This also
+    // bounds handshake reads, so very slow clients may be disconnected sooner.
+    gScreen->maxClientWait = 3000;
 
     // Server bind addresses
     in_addr_t v4Addr = INADDR_ANY;
@@ -3871,6 +4010,24 @@ static void tvStopRfbEventThread(void) {
 
 static void initializeAndRunRfbServer(void) {
     rfbInitServer(gScreen);
+    if (!isRepeaterEnabled() && gPort > 0) {
+        int attempt = 0;
+        while (gScreen->listenSock == RFB_INVALID_SOCKET && gScreen->listen6Sock == RFB_INVALID_SOCKET && attempt < 5) {
+            ++attempt;
+            TVPrintError("VNC listener bind failed on port %d (attempt %d/5); retrying in 300ms", gPort, attempt);
+            usleep(300 * 1000);
+            // LibVNCServer marks sockets READY even when bind fails. Reset this state so
+            // rfbInitSockets will actually retry instead of immediately returning.
+            gScreen->socketState = RFB_SOCKET_INIT;
+            gScreen->listenSock = RFB_INVALID_SOCKET;
+            gScreen->listen6Sock = RFB_INVALID_SOCKET;
+            rfbInitSockets(gScreen);
+        }
+        if (gScreen->listenSock == RFB_INVALID_SOCKET && gScreen->listen6Sock == RFB_INVALID_SOCKET) {
+            TVPrintError("FATAL: VNC port %d failed to bind after retries; exiting for launchd respawn", gPort);
+            exit(EXIT_FAILURE);
+        }
+    }
     TVLog(@"VNC server initialized on port %d, %dx%d, name '%@'", gPort, gWidth, gHeight, gDesktopName);
 
     if (isRepeaterEnabled()) {
@@ -4205,6 +4362,7 @@ int main(int argc, const char *argv[]) {
         prepareBulletinManager();
         prepareClipboardManager();
         prepareScreenCapturer();
+        setupH264Streamer();
 
         initializeAndRunRfbServer();
 

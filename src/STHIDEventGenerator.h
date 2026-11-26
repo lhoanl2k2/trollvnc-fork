@@ -170,6 +170,11 @@ __used NS_INLINE void STAccurateSleep(NSTimeInterval seconds) {
 // sync seconds
 - (void)dragCurveWithStartPoint:(CGPoint)startLocation endPoint:(CGPoint)endLocation duration:(NSTimeInterval)seconds;
 
+// damped wheel scroll (holds briefly before lift to prevent runaway inertia)
+- (void)scrollDampedWithStartPoint:(CGPoint)startLocation endPoint:(CGPoint)endLocation duration:(NSTimeInterval)seconds;
+
+- (BOOL)hasActiveTouch;
+
 /* MARK: --- Pinches --- */
 
 // sync seconds
