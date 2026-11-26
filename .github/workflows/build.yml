@@ -171,7 +171,9 @@ jobs:
             roothide) suffix=roothide ;;
             *) echo "Unexpected package scheme: ${{ matrix.scheme }}" >&2; exit 1 ;;
           esac
-          cp "${debs[0]}" "artifacts/packages-${{ matrix.scheme }}/TrollVNC-iosview_3.3-1009_${suffix}.deb"
+          pkg_ver=$(sed -n 's/^export PACKAGE_VERSION := //p' Makefile | tr -d '\r')
+          if [ -z "$pkg_ver" ]; then echo "Unable to read PACKAGE_VERSION from Makefile" >&2; exit 1; fi
+          cp "${debs[0]}" "artifacts/packages-${{ matrix.scheme }}/TrollVNC-iosview_${pkg_ver}_${suffix}.deb"
 
       - name: Upload dSYM artifacts
         uses: actions/upload-artifact@v4

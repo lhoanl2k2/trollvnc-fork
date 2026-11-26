@@ -24,6 +24,7 @@
 #import <UIKit/UIImage.h>
 #import <UIKit/UIScreen.h>
 #import <mach/mach.h>
+#import <CoreFoundation/CoreFoundation.h>
 
 #import "Control.h"
 #import "IOKitSPI.h"
@@ -58,15 +59,17 @@ void CARenderServerRenderDisplay(kern_return_t a, CFStringRef b, IOSurfaceRef su
 
 + (instancetype)sharedCapturer {
     static ScreenCapturer *_inst = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        _inst = [[self alloc] init];
-        // Defaults for stats logging
+    @synchronized(self) {
+        if (_inst == nil) {
+            _inst = [[self alloc] init];
+            if (_inst != nil) {
 #if DEBUG
-        [_inst setStatsLogWindowSeconds:5.0];
-        [_inst setInstantFpsSmoothingFactor:0.2];
+                [_inst setStatsLogWindowSeconds:5.0];
+                [_inst setInstantFpsSmoothingFactor:0.2];
 #endif
-    });
+            }
+        }
+    }
     return _inst;
 }
 
@@ -79,6 +82,13 @@ void CARenderServerRenderDisplay(kern_return_t a, CFStringRef b, IOSurfaceRef su
     CGSize screenSize = [[UIScreen mainScreen] _unjailedReferenceBoundsInPixels].size;
 
 #if !TARGET_IPHONE_SIMULATOR
+    for (int attempt = 0; attempt < 30 && (screenSize.width <= 0 || screenSize.height <= 0); ++attempt) {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, false);
+        screenSize = [[UIScreen mainScreen] _unjailedReferenceBoundsInPixels].size;
+    }
+    if (screenSize.width <= 0 || screenSize.height <= 0) {
+        return nil;
+    }
     if (gOrientationFixQuad % 2 != 0) {
         // Odd quadrant (90° or 270°) — swap width and height
         width = (int)round(screenSize.height);

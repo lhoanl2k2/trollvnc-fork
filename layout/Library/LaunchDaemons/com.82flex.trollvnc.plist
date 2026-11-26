@@ -18,15 +18,13 @@
 	<key>ExitTimeOut</key>
 	<integer>3</integer>
 	<key>GroupName</key>
-	<string>mobile</string>
+	<string>wheel</string>
 	<key>HighPriorityIO</key>
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
 	<key>Label</key>
 	<string>com.82flex.trollvnc</string>
-	<key>POSIXSpawnType</key>
-	<string>App</string>
 	<key>ProcessType</key>
 	<string>Interactive</string>
 	<key>ProgramArguments</key>
@@ -43,7 +41,7 @@
 	<key>ThrottleInterval</key>
 	<integer>1</integer>
 	<key>UserName</key>
-	<string>mobile</string>
+	<string>root</string>
 	<key>_AdditionalProperties</key>
 	<dict>
 		<key>RunningBoard</key>

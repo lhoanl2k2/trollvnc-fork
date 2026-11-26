@@ -30,6 +30,7 @@
 #import <cstring>
 #import <errno.h>
 #import <fcntl.h>
+#import <grp.h>
 #import <mach-o/dyld.h>
 #import <netinet/in.h>
 #import <netinet/tcp.h>
@@ -4170,22 +4171,30 @@ static void dropPrivileges(void) {
         return;
     }
 
-    int rc;
-    if (getuid() != REQUIRED_UID) {
-        rc = setuid(REQUIRED_UID);
+    if (getuid() == 0) {
+        // Best effort: supplement the mobile primary group with its configured groups
+        // while root authority is still available.
+        (void)initgroups("mobile", REQUIRED_GID);
+    }
+    if (getgid() != REQUIRED_GID || getegid() != REQUIRED_GID) {
+        int rc = setgid(REQUIRED_GID);
         if (rc != 0) {
-            TVPrintError("Failed to set uid to %d: %d", REQUIRED_UID, rc);
+            TVPrintError("Failed to set gid to %d: %d", REQUIRED_GID, errno);
+            exit(EXIT_FAILURE);
+        }
+    }
+    if (getuid() != REQUIRED_UID || geteuid() != REQUIRED_UID) {
+        int rc = setuid(REQUIRED_UID);
+        if (rc != 0) {
+            TVPrintError("Failed to set uid to %d: %d", REQUIRED_UID, errno);
             exit(EXIT_FAILURE);
         }
     }
 
-    if (getgid() != REQUIRED_GID) {
-        rc = setgid(REQUIRED_GID);
-        if (rc != 0) {
-            TVPrintError("Failed to set gid to %d: %d", REQUIRED_GID, rc);
-            // exit(EXIT_FAILURE);
-        }
-    }
+    setenv("USER", "mobile", 1);
+    setenv("LOGNAME", "mobile", 1);
+    setenv("HOME", "/var/mobile", 1);
+    unsetenv("CFFIXED_USER_HOME");
 }
 
 static void cleanupAndExit(int code) {
