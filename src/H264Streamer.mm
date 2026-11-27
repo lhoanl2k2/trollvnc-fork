@@ -62,6 +62,7 @@ static const int kPoolThreshold = 6;
 
 static int gPort = 0;
 static int gBitrateKbps = 2500;
+static int gAppliedBitrateKbps = 0;
 static int gMaxFps = 60;     // current stream frame rate (gEncQ)
 static int gDefaultFps = 60; // configured rate, restored when no client is left
 static int gScalePct = 100;  // encoded size in % of the screen (gEncQ)
@@ -169,6 +170,7 @@ static void setPB(CVPixelBufferRef *slot, CVPixelBufferRef pb) {
 static BOOL ensureSession(int w, int h);
 
 static void teardownEncoder(void) {
+    gAppliedBitrateKbps = 0;
     if (gSession) {
         VTCompressionSessionRef s = gSession;
         gSession = NULL;
@@ -236,17 +238,20 @@ static void recoverFromEncoderError(OSStatus errCode) {
 }
 
 static void applyBitrate(int kbps) {
-    if (!gSession)
-        return;
     if (kbps < 100)
         kbps = 100;
     if (kbps > 20000)
         kbps = 20000;
     gBitrateKbps = kbps;
+    if (!gSession || gAppliedBitrateKbps == kbps)
+        return;
     // Rely on AverageBitRate + RealTime without a tight 1s DataRateLimits cap:
     // on A11 (iPhone 8), a hard 1s byte ceiling starves IDR keyframes and faults
     // the session (-12911/-12903) during full-screen high-motion video playback.
-    VTSessionSetProperty(gSession, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFTypeRef) @(kbps * 1000));
+    OSStatus status = VTSessionSetProperty(gSession, kVTCompressionPropertyKey_AverageBitRate,
+                                           (__bridge CFTypeRef) @(kbps * 1000));
+    if (status == noErr)
+        gAppliedBitrateKbps = kbps;
 }
 
 static void wakeKeyFrame(void) {
@@ -517,6 +522,9 @@ static BOOL ensureSession(int w, int h) {
     VTSessionSetProperty(gSession, kVTCompressionPropertyKey_ProfileLevel, profile);
     VTSessionSetProperty(gSession, kVTCompressionPropertyKey_H264EntropyMode, kVTH264EntropyMode_CABAC);
     VTSessionSetProperty(gSession, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse); // no B-frames
+    VTSessionSetProperty(gSession, kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2);
+    VTSessionSetProperty(gSession, kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
+    VTSessionSetProperty(gSession, kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2);
     VTSessionSetProperty(gSession, kVTCompressionPropertyKey_MaxFrameDelayCount, (__bridge CFTypeRef) @0);
     // Keyframes only on demand (new viewer / resync); TCP never loses data.
     VTSessionSetProperty(gSession, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFTypeRef) @7200);
@@ -636,6 +644,20 @@ static void encodeNow(void) {
     int nb = gNewBitrateKbps.exchange(0);
     if (nb > 0)
         applyBitrate(nb);
+    int targetKbps = gBitrateKbps;
+    if (isRefine && !key) {
+        // Refine frames can use extra bitrate to restore detail, then return to
+        // the configured target on the next ordinary frame.
+        int boosted = (int)MIN(20000LL, MAX((long long)gBitrateKbps * 2, (long long)gBitrateKbps + 1200));
+        targetKbps = boosted;
+    }
+    if (gSession && gAppliedBitrateKbps != targetKbps) {
+        OSStatus bitrateStatus = VTSessionSetProperty(
+            gSession, kVTCompressionPropertyKey_AverageBitRate,
+            (__bridge CFTypeRef) @(targetKbps * 1000));
+        if (bitrateStatus == noErr)
+            gAppliedBitrateKbps = targetKbps;
+    }
 
     NSDictionary *props = key ? @{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame : @YES} : nil;
     int rot = gRotFn ? (gRotFn() & 3) : 0;
